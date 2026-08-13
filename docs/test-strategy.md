@@ -1,282 +1,167 @@
-# EventHub — Booking Management Test Strategy
+# Test Strategy — Booking Management
 
-Generated: 2026-03-06
-Input: `docs/test-scenarios.md` (53 scenarios, TC-001 to TC-510)
+Input: `docs/test-scenarios.md` (65 scenarios, TC-001–TC-510). Consumed by `/generate-tests`.
 
----
+## Tooling gap (read this before generating tests)
 
-## 1. Layer Distribution Summary
+The repo has **only Playwright** installed (root `package.json`: `@playwright/test`, `concurrently`). No Jest, Vitest, or React Testing Library exists in `frontend/package.json` or `backend/package.json`, and no `*.test.js` convention exists anywhere in the tree.
 
-| Layer | TC Count | Focus | Approx. Run Time |
+Practical consequence for `/generate-tests`:
+- **E2E** tests can be written today (existing pattern in `tests/booking-management.spec.js`).
+- **API** tests can be written today using Playwright's `request` fixture (`APIRequestContext`) against the backend REST endpoints — no new tooling required. This is the layer most of the scenarios below should land on, and it's currently at zero tests.
+- **Unit** and **Component** tests are not executable as-is. Standing them up requires adding Jest (or Vitest) + `ts-jest`/`babel-jest`, and `@testing-library/react` for component tests, plus wiring a script in `frontend/package.json`. Until that lands, scenarios assigned to Unit/Component below are the *target* layer; treat them as backlog for the harness, not as work `/generate-tests` can emit immediately. Flag this explicitly rather than silently writing them as E2E, which would defeat the purpose of the assignment.
+- One specific blocker for Unit testing the frontend: the client-side `validate()` function in `frontend/app/events/[id]/page.tsx:88-95` is an inline closure inside `BookingForm`, not an exported pure function. It can't be unit tested without extracting it first. Recommend the extraction as a prerequisite to unlock TC-308–TC-311 as true unit tests instead of Component tests.
+
+## Distribution
+
+| Layer | Count | Focus | Est. time (per test / total) |
 |---|---|---|---|
-| **Unit** | 5 | Pure functions with no I/O (`randomRef`, `generateUniqueRef`, price calc) | < 1s total |
-| **API / Integration** | 22 | Backend contract, auth enforcement, business rule execution, DB state | 10–30s total |
-| **Component** | 14 | Client-side UI states, conditional rendering, mocked API responses | 5–15s total |
-| **E2E** | 12 | Critical user journeys, multi-page flows, cross-session security | 2–5 min total |
-| **Total** | **53** | | |
+| Unit | 3 | Pure functions: booking-ref generation, JWT verification logic | ~2 min / ~6 min |
+| Component | 27 | Form validation, refund-eligibility state machine, loading/empty/error states, stepper bounds, cancel dialogs | ~5 min / ~135 min |
+| API | 31 | Business rules, validation contracts, security/ownership checks, pagination, error codes | ~5 min / ~155 min |
+| E2E | 4 | Critical full-stack journeys against the live site | ~12 min / ~48 min |
+| **Total** | **65** | | **~344 min (~5.7 hrs)** |
 
-**Pyramid shape**: Unit (5) → API (22) → Component (14) → E2E (12) ✓
+Shape: wide at Component/API, narrow at E2E — inverted from the current suite, which has 6 E2E tests and 0 API/Component/Unit tests (see Anti-Patterns below).
 
-> **Note on multi-layer coverage**: TC-102 (booking ref prefix) and TC-106 (price calculation) are intentionally tested at Unit + API for defense-in-depth. The E2E layer confirms only the critical happy path end-to-end.
+## Critical rules tested at multiple layers (defense-in-depth)
 
----
-
-## 2. Layer Assignments
-
-### Unit Tests
-_Criteria: Pure function, no I/O, no DB. Source: `backend/src/services/bookingService.js`_
-
-| TC | Title | Function Under Test | File:Line |
-|---|---|---|---|
-| TC-102 | Booking ref prefix matches event title first character | `randomRef(eventTitle)` | `bookingService.js:11` |
-| TC-405 | Booking ref uniqueness — collision retry mechanism | `generateUniqueRef(eventTitle)` with mocked `findByRef` | `bookingService.js:21` |
-| TC-406 | Price calculation: totalPrice = price × quantity | inline expression `parseFloat(event.price) * data.quantity` | `bookingService.js:99` |
-| TC-408 | Event title starting with digit — prefix is digit char | `randomRef('100 Days Festival')` | `bookingService.js:12` |
-
-**Rationale**: `randomRef()` and `generateUniqueRef()` are pure/near-pure functions requiring only a mocked `bookingRepository.findByRef`. Testing them at API or E2E adds overhead with no added confidence. The price formula is a one-liner with no branching — unit is the correct and only layer needed.
-
----
-
-### API / Integration Tests
-_Criteria: Backend business rule, API contract, or requires real DB state. Auth enforced via JWT. Source: `bookingController.js`, `bookingService.js`, `bookingValidator.js`_
-
-#### Happy Path — API contracts
-| TC | Title | Endpoint | Service Function |
-|---|---|---|---|
-| TC-007 | Lookup booking by reference | `GET /api/bookings/ref/:ref` | `bookingService.getBookingByRef` |
-| TC-107 | Bookings list pagination response shape | `GET /api/bookings?page=1&limit=10` | `bookingService.getBookings` |
-| TC-407 | Page 2 pagination with partial results | `GET /api/bookings?page=2&limit=5` | `bookingService.getBookings` |
-
-#### Business Rules — DB-dependent
-| TC | Title | Service Function | Key Code |
-|---|---|---|---|
-| TC-100 / TC-400 | FIFO pruning — 10th booking deletes oldest from different event | `bookingService.createBooking` | `findOldestUserBookingExcludingEvent` at `bookingService.js:73` |
-| TC-101 / TC-401 | FIFO same-event fallback — seat permanently burned | `bookingService.createBooking` | `sameEventFallback` + `eventRepository.decrementSeats` at `bookingService.js:95` |
-| TC-108 | Seat release after cancel (dynamic event, computed availability) | `bookingService.cancelBooking` | `bookingRepository.delete(id)` at `bookingService.js:133` |
-| TC-406 | Clear all with 1 booking — `deleted` count = 1 | `bookingService.clearAllBookings` | `bookingRepository.deleteAllForUser` at `bookingService.js:122` |
-
-#### Security — Auth Enforcement
-| TC | Title | Endpoint | Enforcement Point |
-|---|---|---|---|
-| TC-201 | Cross-user GET booking returns 403 | `GET /api/bookings/:id` | `bookingService.js:57`: `booking.userId !== userId` |
-| TC-202 | Cross-user DELETE booking returns 403 | `DELETE /api/bookings/:id` | `bookingService.js:129`: `booking.userId !== userId` |
-| TC-206 | Cross-user ref lookup returns 403 | `GET /api/bookings/ref/:ref` | `bookingService.js:64`: `booking.userId !== userId` |
-| TC-203 | Unauthenticated GET /api/bookings returns 401 | `GET /api/bookings` | Auth middleware (no token) |
-| TC-204 | Unauthenticated GET /api/bookings/:id returns 401 | `GET /api/bookings/:id` | Auth middleware |
-| TC-205 | Unauthenticated DELETE /api/bookings returns 401 | `DELETE /api/bookings` | Auth middleware |
-
-#### Negative / Validation
-| TC | Title | Validator / Service | Validation Rule |
-|---|---|---|---|
-| TC-301 | GET non-existent booking returns 404 | `bookingService.getBookingById` | `NotFoundError` at `bookingService.js:56` |
-| TC-302 | Create booking with insufficient seats returns 400 | `bookingService.createBooking` | `InsufficientSeatsError` at `bookingService.js:89` |
-| TC-303 | Create booking for non-existent event returns 404 | `bookingService.createBooking` | `NotFoundError` at `bookingService.js:83` |
-| TC-304 | Missing required fields returns 400 | `bookingValidator.validateCreateBooking` | `bookingValidator.js:22-44` |
-| TC-305 | Quantity = 0 or negative returns 400 | `bookingValidator.validateCreateBooking` | `isInt({ min: 1, max: 10 })` at `bookingValidator.js:39` |
-| TC-306 | Quantity > 10 returns 400 | `bookingValidator.validateCreateBooking` | `isInt({ min: 1, max: 10 })` at `bookingValidator.js:39` |
-| TC-307 | Cancel already-cancelled booking returns 404 | `bookingService.cancelBooking` | `bookingRepository.findById` returns null → `NotFoundError` |
-
----
-
-### Component Tests
-_Criteria: Single component renders correctly for a given prop or mocked state. No real network calls. Source: `frontend/app/bookings/page.tsx`, `frontend/app/bookings/[id]/page.tsx`_
-
-#### Refund Eligibility — `RefundEligibility` component (`[id]/page.tsx:21`)
-| TC | Title | Props / State | Assertion |
-|---|---|---|---|
-| TC-103 | quantity=1 → "Eligible for refund" result | `quantity={1}`, click check, wait 4s | `#refund-result` contains "Eligible for refund." |
-| TC-104 | quantity=3 → "Not eligible" with correct count | `quantity={3}`, click check, wait 4s | `#refund-result` contains "Group bookings (3 tickets) are non-refundable" |
-| TC-404 | quantity=2 boundary → NOT eligible | `quantity={2}`, click check, wait 4s | `#refund-result` shows ineligible message |
-| TC-105 | Spinner shows during the 4-second check | `quantity={1}`, click check | `#refund-spinner` visible immediately; disappears after 4s (`timeout: 6000`) |
-| TC-508 | Full state machine: idle → checking → result | `quantity={1}` | Button hidden after click; spinner visible then replaced by result |
-
-#### Bookings List — `BookingsContent` component (`page.tsx:14`)
-| TC | Title | Mocked State | Assertion |
-|---|---|---|---|
-| TC-500 | Loading skeleton renders while fetching | `isLoading = true` (mock) | 5 `BookingCardSkeleton` elements visible |
-| TC-501 | Empty state when no bookings | `data.data = []` (mock empty response) | "No bookings yet" heading + "Browse Events" link |
-| TC-308 | Error state when server unreachable | `isError = true` (mock) | "Couldn't load bookings" + "Retry" button visible |
-| TC-109 | "Clear all bookings" button always visible with bookings | `data.data = [booking]` | "Clear all bookings" link in DOM |
-| TC-507 | Button shows "Clearing…" during in-flight API call | `clearing = true` state | Button text = "Clearing…", `disabled` attribute set |
-| TC-510 | Pagination renders when totalPages > 1 | Mock `pagination.totalPages = 3` | Pagination component visible with correct page |
-
-#### Booking Detail — `BookingDetailPage` component (`[id]/page.tsx:91`)
-| TC | Title | Mocked State | Assertion |
-|---|---|---|---|
-| TC-502 | Full-screen spinner while loading | `isLoading = true` (mock) | `Spinner size="lg"` visible |
-| TC-300 | "Booking not found" renders on 404 | `isError = true`, `error.status = 404` | EmptyState title = "Booking not found" |
-
----
-
-### E2E Tests
-_Criteria: Multi-page user journey, full-stack data flow, cross-session security requiring real browser state. Source: Playwright, `playwright.config.ts`_
-
-#### Critical Happy Paths (must have green before shipping)
-| TC | Title | Precondition | Journey Scope |
-|---|---|---|---|
-| TC-001 | View bookings list with existing bookings | 1+ bookings in DB | Login → `/bookings` → assert cards rendered |
-| TC-002 | View single booking detail page | 1+ bookings | Login → `/bookings` → "View Details" → `/bookings/:id` → assert all sections |
-| TC-003 | Cancel a single booking from detail page | 1+ bookings | Login → detail → "Cancel Booking" → confirm → assert redirect + toast |
-| TC-004 | Clear all bookings | 1+ bookings | Login → `/bookings` → "Clear all bookings" → confirm → assert empty state |
-| TC-006 | Navigate to bookings after completing a booking | Fresh account | Login → book event → "View My Bookings" → assert booking in list |
-
-#### Business Rule Validation (E2E confirms end-to-end rule enforcement)
-| TC | Title | What E2E Adds Over API Test |
+| Rule | Layers | Why both |
 |---|---|---|
-| TC-102 | Booking ref prefix matches event title first character | Validates the confirmation card UI displays the correct ref, not just API response |
+| Cross-user booking access denied | API (TC-200) + E2E (TC-200) | API proves the 403 contract (`bookingService.getBookingById`, `backend/src/services/bookingService.js:54-59`); E2E proves the real two-session, real-JWT flow renders "Access Denied" in the actual UI — a security boundary is worth the redundant coverage. |
+| Booking reference format (`[TITLE_FIRST_CHAR]-[6_ALNUM]`) | Unit (TC-003, TC-109) + one incidental E2E assertion inside TC-001 | Unit isolates `randomRef`/`generateUniqueRef` (`backend/src/services/bookingService.js:11-32`) with zero I/O; TC-001's E2E happy path already surfaces a real `bookingRef` on the confirmation card, so asserting the pattern there is free — no need for a *dedicated* E2E test (see Anti-Patterns: this is what the existing suite gets wrong). |
+| Insufficient-seats rejection | API (TC-300, TC-319, TC-400) + Component (TC-301, TC-402 UI cap) | API proves the server won't oversell; Component proves the UI prevents the user from even attempting it (disabled "Sold Out" button, stepper capped at `availableSeats`). Both matter because the UI cap is advisory — the API is the actual enforcement point (see TC-404 concurrency gap below). |
+| Client vs. server validation parity | Component (TC-308–311) + API (TC-308–313, TC-312) | The client's phone check (`events/[id]/page.tsx:92`, digit-count only) is weaker than the server's regex (`bookingValidator.js:36`, char-class check). TC-312 is **API-only by necessity** — it tests a gap the client can't catch. |
 
-#### Security (requires two browser sessions)
-| TC | Title | Why Must Be E2E |
+## Layer assignments
+
+### Unit (3)
+
+| TC | Title | Target source | Rationale |
+|---|---|---|---|
+| TC-003 | Booking ref first char matches event title | `backend/src/services/bookingService.js:11-18` (`randomRef`) | Pure string formatting, zero I/O. Mock nothing — call the function directly with a title, assert the prefix. |
+| TC-109 | Booking ref collision retry / fallback format | `backend/src/services/bookingService.js:20-32` (`generateUniqueRef`) | Needs `bookingRepository.findByRef` mocked to force 10 collisions, then assert the `Date.now()`-based fallback format. No real DB needed — classic unit-with-mocked-dependency case. |
+| TC-205 | Invalid/expired JWT rejected | `backend/src/middleware/authMiddleware.js` | Middleware is a pure `(req, res, next)` function around `jwt.verify` — testable by mocking `req.headers.authorization` and asserting the `res.status(401)` call, no server needed. |
+
+### Component (27)
+
+| TC | Title | Target source |
 |---|---|---|
-| TC-200 | Cross-user access shows "Access Denied" UI | Requires login as User A, capture booking ID, logout, login as User B, navigate — multi-session flow |
-| TC-509 | Access Denied vs Booking Not Found — correct state rendered | Validates `error.status === 403` branch in `[id]/page.tsx:119` renders "Access Denied" not "not found" |
+| TC-004 | View list of bookings (rendering) | `frontend/app/bookings/page.tsx` + `BookingCard.jsx`, mocked `useBookings` |
+| TC-005 | Booking detail sections render | `frontend/app/bookings/[id]/page.tsx`, mocked `useBooking` |
+| TC-009 | Cancel-all native confirm() decline → no-op | `frontend/app/bookings/page.tsx:27-36` |
+| TC-010 | Refund eligibility — eligible (qty=1) | `RefundEligibility` component, `bookings/[id]/page.tsx:21-30` |
+| TC-011 | Refund eligibility — ineligible (qty>1) | same |
+| TC-208 | XSS payload in customerName renders as inert text | `BookingCard.jsx` / detail page, fed a crafted booking prop |
+| TC-301 | Sold-out event disables Confirm Booking | `events/[id]/page.tsx:83,152-154` |
+| TC-308 | Empty/whitespace customerName — client error | `events/[id]/page.tsx:90` (post-extraction, prefer Unit — see Tooling Gap) |
+| TC-309 | 1-char customerName — client error | same |
+| TC-310 | Malformed email — client error | `events/[id]/page.tsx:91` |
+| TC-311 | Phone <10 digits — client error | `events/[id]/page.tsx:92` |
+| TC-401 | Stepper allows up to 10 when seats ≥ 10 (UI half) | `events/[id]/page.tsx:81,127-131` |
+| TC-402 | Stepper caps at availableSeats when <10 | same |
+| TC-403 | Stepper can't go below 1 | `events/[id]/page.tsx:120-123` |
+| TC-406 | Refund spinner visible ~4s | `bookings/[id]/page.tsx:26-28`, use fake timers, not real `waitForTimeout` |
+| TC-407 | Refund check button unmounts after click (no double-trigger) | same |
+| TC-500 | Bookings list loading skeletons | `bookings/page.tsx:66-70` |
+| TC-501 | Bookings list error + Retry | `bookings/page.tsx:72-78`, mock failed fetch |
+| TC-502 | Bookings list empty state | `bookings/page.tsx:80-92`, mock empty response |
+| TC-503 | "Clearing…" label during clear-all | `bookings/page.tsx:27-36,55-61` |
+| TC-504 | No sandbox banner on `/bookings` at any count | `bookings/page.tsx` (absence check) vs. `events/page.tsx:74-83` (presence check) |
+| TC-505 | Cancel button hidden when status ≠ confirmed | `BookingCard.jsx:82-84`, `bookings/[id]/page.tsx:166-168` |
+| TC-506 | Cancel dialog interpolates correct quantity/ref | `BookingCard.jsx:89`, `bookings/[id]/page.tsx:221` |
+| TC-507 | Confirmation renders in-place (no navigation) | `events/[id]/page.tsx:77-79` |
+| TC-508 | Confirm-booking button prevents double submit | `events/[id]/page.tsx:71,103-109,152`, mock delayed API response |
+| TC-509 | Validation errors clear on valid resubmit | `events/[id]/page.tsx:99-101` |
+| TC-510 | Error toast + dialog close on cancel failure | `BookingCard.jsx:35-38`, `bookings/[id]/page.tsx:107-110` |
 
-#### Edge Case UI Behaviors (requires real UI interaction)
-| TC | Title | Why Must Be E2E |
+### API (31)
+
+| TC | Title | Endpoint / source |
 |---|---|---|
-| TC-402 | Quantity = 1 minimum — decrement button disabled at 1 | UI button disabling requires real DOM interaction |
-| TC-403 | Quantity = 10 maximum — increment button disabled at 10 | UI button disabling requires real DOM interaction |
-| TC-404* | Refund eligibility at qty=2 | *Preferred as Component; E2E only if Component tests don't exist |
+| TC-002 | Book multiple tickets, totalPrice = price × qty | `POST /api/bookings`, `bookingService.js:99` |
+| TC-012 | Lookup booking by ref | `GET /api/bookings/ref/:ref` |
+| TC-013 | Filter bookings by eventId/status | `GET /api/bookings` |
+| TC-100 | 9th booking succeeds, no pruning | `bookingService.js:70-79` (`MAX_USER_BOOKINGS = 9`) |
+| TC-101 | 10th booking prunes oldest (different event) | `bookingService.js:69-79`, `findOldestUserBookingExcludingEvent` |
+| TC-102 | Same-event FIFO fallback burns seats via `decrementSeats` | `bookingService.js:71-97` — **flagged as a likely real bug**, test both the deletion and the permanent seat loss |
+| TC-103 | Seat check ordering after prune | `bookingService.js:70-92` |
+| TC-104 | 7th custom event prunes oldest event | `eventService.js` equivalent (event limit) |
+| TC-105 | Cascade delete removes bookings of pruned event | Prisma `onDelete: Cascade` on `Event.bookings` |
+| TC-106 | Per-user seat isolation on dynamic events | `bookingRepository.js:78-90` (`getBookedQuantitiesForEvents`) |
+| TC-107 | Same user, cumulative bookings on same dynamic event | same |
+| TC-108 | Cancel restores seats on static event | `bookingService.js:126-136` vs. `cancelBooking` comment — verify actual behavior, candidate bug |
+| TC-110 | totalPrice snapshot uses price at booking time, not current price | `bookingService.js:99` |
+| TC-200 | Cannot view another user's booking by ID (403) | `GET /api/bookings/:id`, `bookingService.js:54-59` |
+| TC-201 | Cannot view another user's booking by ref (403) | `GET /api/bookings/ref/:ref`, `bookingService.js:61-66` |
+| TC-202 | Cannot cancel another user's booking | `DELETE /api/bookings/:id` — **verify actual status code**, `findById` scopes by `userId` so this likely 404s, not 403s (asymmetric with GET) |
+| TC-203 | List always scoped to caller's userId | `bookingRepository.js:8-10` |
+| TC-204 | No Bearer token → 401 | `authMiddleware.js:4-6` |
+| TC-206 | Booking with a JWT for a deleted userId → FK error | `errorHandler.js` P2003 mapping |
+| TC-207 | SQL-injection-style payloads handled safely | Prisma parameterization, any booking field |
+| TC-209 | eventId tampering to reach an inaccessible dynamic event | `eventRepository.findById(eventId, userId)` |
+| TC-210 | IDOR — sequential booking ID enumeration | `GET /api/bookings/:id` |
+| TC-300 | Quantity exceeds available seats → 400 | `bookingService.js:86-92` |
+| TC-302 | quantity = 0 → validation error | `bookingValidator.js:38-41` |
+| TC-303 | quantity = 11 → validation error | same |
+| TC-304 | Negative / non-integer quantity → validation error | same |
+| TC-305 | Missing eventId → validation error | `bookingValidator.js:16-19` |
+| TC-306 | Nonexistent eventId → 404 | `bookingService.js:82-83` |
+| TC-307 | eventId non-numeric → validation error | `bookingValidator.js:18` |
+| TC-312 | Phone with letters → 400 (server-only gap, see table above) | `bookingValidator.js:36` |
+| TC-313 | All fields missing → aggregated `details[]` | `bookingValidator.js:3-13` |
+| TC-314 | Cancel nonexistent booking → 404 | `bookingService.js:126-129` |
+| TC-315 | Double-cancel same booking → second call 404 | same |
+| TC-316 | Lookup by nonexistent ref → 404 | `bookingService.js:62-63` |
+| TC-317 | Lookup by non-numeric ID → verify no 500 | `bookingRepository.js:34-39`, `Number("abc")` = `NaN` — candidate bug |
+| TC-318 | Clear-all when zero bookings → safe no-op | `bookingService.js:121-124` |
+| TC-319 | Insufficient-seats message has exact count | `bookingService.js:88-91` |
+| TC-400 | Book the last available seat | seat math |
+| TC-401 | Book qty=10 when seats allow (server half) | `bookingValidator.js:40` |
+| TC-404 | Concurrent requests for the last seat — race condition | `bookingService.js:85-92` — read-then-write, **not wrapped in a transaction; likely overselling bug**, needs a dedicated concurrent-request test (fire 2 requests via `Promise.all`, assert exactly one succeeds) |
+| TC-405 | 9-booking limit + qty=10 request combined | `bookingService.js:69-79` |
+| TC-408 | Very long customerName — no max-length validation | `bookingValidator.js` (gap: no `.isLength({max})`) |
+| TC-409 | Unicode/emoji in customerName | DB charset `utf8mb4` |
+| TC-410 | Pagination — exactly one full page (10 bookings) | `bookingService.js:44-51` |
+| TC-411 | Page number beyond totalPages → empty data, no error | `bookingRepository.js:8-24` |
 
-#### UI State Requiring Real Navigation
-| TC | Title | Why Must Be E2E |
+(Table above intentionally lists 31 rows spanning both the original "Business Rule"/"Negative"/"Edge Case" categories — API is where backend-owned behavior belongs regardless of the scenario doc's category label.)
+
+### E2E (4)
+
+| TC | Title | Why it stays at E2E |
 |---|---|---|
-| TC-503 | Cancel booking confirmation dialog appears | Requires real booking ID + navigation to detail page; dialog needs live DOM |
-| TC-504 | Dismiss cancel dialog — booking NOT cancelled | Same as TC-503; must verify no API call was made after dismiss |
-| TC-505 | Breadcrumb shows booking ref | Part of TC-002; verify `booking.bookingRef` rendered in breadcrumb nav |
-| TC-506 | Cancel success — toast + redirect to `/bookings` | Validates `onSuccess` callback: toast visible + `router.push('/bookings')` |
+| TC-001 | Book a single ticket, full journey (browse → detail → form → confirm) | Canonical critical-path proof that frontend, backend, and DB agree end to end. Also carries the booking-ref-format assertion for free (see defense-in-depth table) — no separate E2E needed for TC-003. |
+| TC-006 | Cancel a booking → toast → redirect → removed from list | Second canonical critical path; exercises the full cancel round-trip including UI confirmation dialog, not just the DELETE contract. |
+| TC-008 | Clear all bookings → empty state | Destructive, irreversible, user-visible action; worth one real run against the live app rather than trusting a mocked Component test alone. |
+| TC-200 | Cross-user "Access Denied" — real two-session flow | Security boundary; proves actual JWT-based enforcement across two real logins, not just the mocked/API 403 contract. |
 
----
+All other "critical flow" scenarios (TC-002, TC-004, TC-005, TC-007) are **not** separately needed at E2E — they're sub-cases or rendering checks of the same journeys TC-001/TC-006 already exercise, and are cheaper to prove at Component/API (see rationale below).
 
-## 3. Decision Rationale — Contested Assignments
+## Decision rationale for contested assignments
 
-### TC-103 / TC-104 / TC-105 — Refund Eligibility → Component (not E2E)
-**Original suggestion**: E2E / Component
-**Decision**: Component only
+- **TC-003 pushed from E2E/API → Unit.** This is the highest-value pushdown in the set. The original scenario doc suggested E2E/API, and the *existing* test suite (`tests/booking-management.spec.js`, `TC-102`) actually does test this via a full login → browse → book flow against production. But `randomRef` (`bookingService.js:11-18`) is a one-line string formatter with zero I/O — it doesn't need a browser, a server, or a database to verify. This is the textbook "pure logic tested at E2E" anti-pattern from the skill's own checklist.
+- **TC-007 folded into TC-006, not a separate test.** TC-007 ("cancel from detail page redirects to list") and TC-006 ("cancel a booking") describe the same user action from two entry points (list card vs. detail page). One E2E test on the detail-page path is sufficient defense; the list-card cancel button is a Component-level rendering/wiring check (TC-505/TC-506), not a second full journey.
+- **TC-002 pushed from Happy-Path/implicit-E2E → API only.** Booking N tickets and checking `totalPrice` is arithmetic (`price × quantity`) plus a round trip — there's no new UI behavior beyond TC-001 (same form, different stepper value). Testing it through a full browser session again buys nothing TC-001 didn't already prove about the journey; the API test isolates the actual thing being verified (server-side price calculation).
+- **TC-102 (same-event FIFO fallback) kept at API, not pushed to Unit.** Unlike TC-003, this logic is inseparable from real DB state (`countUserBookings`, `findOldestUserBookingExcludingEvent`, `decrementSeats` all require Prisma). It's flagged as a probable bug (permanently burning seats on prune) and needs an integration-level test that can actually observe DB state before/after — mocking every collaborator would test the mocks, not the bug.
+- **TC-200 kept at BOTH API and E2E** (see defense-in-depth table) rather than picking one, because it's the one security scenario where the UI-rendered "Access Denied" message and the raw 403 contract are both worth locking down independently — a regression could break either one without breaking the other (e.g., a frontend error-boundary swallowing the 403 and showing a generic error instead of "Access Denied").
+- **TC-404 (race condition) kept at API despite needing non-trivial setup.** It doesn't fit neatly as a "simple" API test, but it's still fundamentally a backend-only concern (`bookingService.js:85-92` has no transaction wrapping the read-check-write sequence) — no UI involvement, so E2E would be pure overhead. Recommend implementing via two concurrent `request.post()` calls with `Promise.all`, not a browser.
+- **TC-308–TC-311 (client-side validation) assigned to Component, flagged for Unit once `validate()` is extracted.** These currently can't be true unit tests because the function isn't exported (see Tooling Gap). Component is the honest layer for "as the code exists today"; extracting `validate()` is a cheap refactor that would drop these to Unit and further thin the pyramid.
+- **TC-505 (cancel button hidden for non-confirmed bookings) kept even though it may be dead code.** Every booking created by the app starts and stays `status: "confirmed"` — there's no in-app flow that transitions status. It's included anyway as a defensive-UI guard test since the schema explicitly models a `cancelled`/other status and a future feature could rely on this guard already being correct.
 
-**Rationale**: The `RefundEligibility` component at `[id]/page.tsx:21` is 100% client-side. The logic is:
-```javascript
-setTimeout(() => {
-  setStatus(quantity === 1 ? 'eligible' : 'ineligible');
-}, 4000);
-```
-There is no backend API call. No database. No network. This makes E2E testing this rule wasteful — it adds login overhead, navigation to a real booking, and 4+ seconds of waiting per test. A component test with `quantity={1}` and `quantity={2}` covers all branches in milliseconds. The 4-second spinner is also best validated at Component level using Playwright's `timeout` assertion, as documented in `playwright-best-practices.md:134`.
+## Anti-patterns found in existing tests (`tests/booking-management.spec.js`)
 
----
+1. **Pure logic tested at E2E.** `TC-102` ("booking reference starts with first letter of event title") does a full login → clear bookings → browse → book → assert flow against the live production site solely to check a string-formatting rule. This is the textbook case the skill's checklist warns about — see rationale above. Fix: replace with a Unit test on `randomRef`, keep the assertion in TC-001's E2E as a bonus check instead of a dedicated test.
+2. **Zero API-layer tests exist.** Every one of the 6 existing tests drives a full browser session against `https://eventhub.rahulshettyacademy.com`. None hit the REST API directly (no use of Playwright's `request` fixture). Every validation rule, error code, and business rule (FIFO pruning, seat math, cross-user 403s) is currently *unverified* — the app could regress any of `bookingValidator.js`, `bookingService.js`, or `bookingRepository.js` without a single test failing, since the UI's own client-side validation would silently prevent the invalid states from ever reaching the server in a browser-driven test.
+3. **Zero Component/Unit tests exist**, and no tooling is installed to write them (see Tooling Gap). Every UI state — loading skeletons, empty states, error+retry, refund-eligibility spinner timing, stepper bounds — is currently unverified anywhere in the suite.
+4. **Ice-cream-cone shape.** 6 E2E / 0 API / 0 Component / 0 Unit is the inverse of a healthy pyramid. All 6 existing tests also share ~80% identical setup (`login` → `clearBookings` → `bookEvent`) re-executed from scratch against a live remote server each time, which is slow (no `fullyParallel`, `retries: 0`) and fragile (shared mutable state on a real account — two tests running out of order could interfere via the 9-booking FIFO limit).
+5. **Test IDs don't trace to any scenario doc.** The existing suite's `TC-001`…`TC-102`…`TC-006` numbering predates `docs/test-scenarios.md` and doesn't correspond to it at all (e.g., existing `TC-102` — booking ref format — is *new* `TC-003`; existing `TC-004` — clear all — is *new* `TC-008`). Traceability from test to documented scenario and business rule is currently broken. Recommend retagging test names with the current scenario IDs (e.g. `TC-001: ...`, `TC-006: ...`) when `/generate-tests` regenerates this file, so `grep TC-200 tests/*.spec.js docs/test-scenarios.md` actually finds both sides.
+6. **Security scenarios are entirely untested.** None of TC-200–TC-210 (cross-user access, IDOR, injection, auth-token handling) exist in the current suite, despite being flagged P0/P1. This is the most important coverage gap to close first when `/generate-tests` runs.
 
-### TC-304 / TC-305 / TC-306 — Validation Errors → API (not E2E)
-**Original suggestion**: API
-**Decision**: API confirmed — do NOT add E2E coverage
+## Recommended generation order for `/generate-tests`
 
-**Rationale**: Input validation lives entirely in `bookingValidator.validateCreateBooking` (`bookingValidator.js:15`). The validator runs before the service layer is even reached. Testing `quantity: 0` at E2E would require filling a form, submitting, and checking an error toast — but the same rule is proven more precisely with a direct `POST /api/bookings` returning `400`. E2E for validation errors is the **ice cream cone anti-pattern**: slow, brittle, and testing at the wrong level.
-
----
-
-### TC-100 / TC-101 / TC-400 / TC-401 — FIFO Pruning → API (not E2E)
-**Original suggestion**: API
-**Decision**: API confirmed — do NOT add E2E coverage for FIFO
-
-**Rationale**: FIFO pruning is orchestrated entirely in `bookingService.createBooking` (`bookingService.js:70-97`). It involves:
-1. `bookingRepository.countUserBookings(userId)` — count check
-2. `bookingRepository.findOldestUserBookingExcludingEvent(userId, eventId)` — FIFO selection
-3. `bookingRepository.delete(oldest.id)` — pruning
-4. `eventRepository.decrementSeats(eventId, quantity)` — seat burn for same-event fallback
-
-None of these are observable in the UI without checking booking counts before and after. An API test can precisely set up 9 bookings, issue the 10th, and assert DB state. E2E would be fragile (requires pre-seeding 9 bookings, timing-sensitive).
-
----
-
-### TC-200 / TC-509 — Cross-User Security → E2E (not just API)
-**Original suggestion**: E2E (Security)
-**Decision**: Both API and E2E required
-
-**Rationale**: TC-201 covers the API-level 403. But TC-200 and TC-509 test the **frontend handling** of the 403 response:
-```typescript
-// [id]/page.tsx:119
-const is403 = (error as any)?.status === 403;
-return <EmptyState title={is403 ? 'Access Denied' : 'Booking not found'} ... />
-```
-This branch is only exercised by navigating to a real cross-user URL in a real browser. The correct EmptyState variant being rendered is a UI-layer assertion that API tests cannot make.
-
----
-
-### TC-500 / TC-501 / TC-308 — Loading/Error/Empty States → Component (not E2E)
-**Original suggestion**: E2E / Component
-**Decision**: Component with mocked API responses
-
-**Rationale**: All three states (loading, error, empty) are driven by React Query flags (`isLoading`, `isError`, empty `data.data`). These are testable via `page.route()` interception as documented in `playwright-best-practices.md:241`:
-```javascript
-await page.route('**/api/bookings**', async (route) => {
-  await route.fulfill({ status: 500, body: JSON.stringify({ error: 'Server error' }) });
-});
-```
-Running a full E2E test just to verify skeleton rendering is wasteful. Component tests with route interception isolate the frontend logic from backend availability.
-
----
-
-## 4. Anti-Patterns to Avoid
-
-These anti-patterns were identified from the suggested layers in `test-scenarios.md` and must NOT be implemented:
-
-| Anti-Pattern | Affected TCs | Correct Approach |
-|---|---|---|
-| Testing `quantity` boundary (0, 11) at E2E | TC-305, TC-306 | API test: `POST /api/bookings` with invalid quantity → verify 400 response from `bookingValidator.js:39` |
-| Testing 4-second refund spinner at E2E (login + navigate + wait) | TC-103, TC-104, TC-105 | Component test: render `<RefundEligibility quantity={1} />`, click, assert spinner then result |
-| Testing FIFO pruning at E2E (requires 9+ bookings pre-seeded) | TC-100, TC-101 | API test: use direct `POST /api/bookings` calls to set up state precisely |
-| Testing "Booking not found" by navigating to `/bookings/99999` at E2E | TC-300 | Component test: mock `isError=true` with `error.status=404` via route interception |
-| Testing auth 401 responses by manipulating UI session at E2E | TC-203, TC-204, TC-205 | API test: send requests without `Authorization` header, assert 401 |
-| No E2E coverage for the cancel booking flow | — | TC-003 and TC-506 must have E2E — cancellation is a destructive action visible to users |
-
----
-
-## 5. Defense-in-Depth Coverage Map
-
-Critical rules covered at multiple layers for maximum confidence:
-
-| Rule | Unit | API | Component | E2E |
-|---|---|---|---|---|
-| Booking ref prefix = event title first char | TC-102 | TC-102 | — | TC-102 |
-| Price = price × quantity | TC-106 | TC-106 | — | TC-006 (implicit) |
-| Refund: qty=1 eligible, qty>1 not eligible | — | — | TC-103, TC-104, TC-404 | — |
-| Cross-user access denied | — | TC-201 | — | TC-200, TC-509 |
-| Cancel booking — data deleted, redirect shown | — | TC-307 | — | TC-003, TC-506 |
-| FIFO pruning at 9 bookings | — | TC-100, TC-101, TC-400, TC-401 | — | — |
-| Auth required (401 on all endpoints) | — | TC-203, TC-204, TC-205 | — | — |
-
----
-
-## 6. Implementation Priority Order
-
-Ship in this order — each tier unblocks the next:
-
-**Tier 1 — P0, must pass before any release**
-- `TC-001, TC-002, TC-003, TC-004` (E2E happy paths)
-- `TC-102` (booking ref rule — Unit + API)
-- `TC-201, TC-202` (security — API)
-- `TC-200` (cross-user access — E2E)
-- `TC-302` (insufficient seats — API)
-
-**Tier 2 — P1, run in CI on every PR**
-- `TC-100, TC-101` (FIFO pruning — API)
-- `TC-103, TC-104, TC-105` (refund eligibility — Component)
-- `TC-203, TC-204, TC-205` (auth enforcement — API)
-- `TC-304, TC-305, TC-306` (validation — API)
-- `TC-500, TC-501, TC-308` (UI states — Component)
-- `TC-503, TC-506` (cancel dialog + success — E2E)
-
-**Tier 3 — P2, run nightly or pre-release**
-- `TC-405, TC-408` (edge cases — Unit)
-- `TC-107, TC-407` (pagination — API)
-- `TC-402, TC-403` (quantity UI boundaries — E2E)
-- `TC-507, TC-508, TC-510` (UI micro-states — Component)
-
----
-
-## 7. Source File Map for Test Generation
-
-| Layer | Test File Location | Key Source Files |
-|---|---|---|
-| Unit | `tests/unit/bookingService.test.js` | `backend/src/services/bookingService.js` |
-| API | `tests/api/bookings.api.spec.js` | `backend/src/routes/`, `backend/src/validators/bookingValidator.js` |
-| Component | `tests/components/booking-ui.spec.js` | `frontend/app/bookings/page.tsx`, `frontend/app/bookings/[id]/page.tsx` |
-| E2E | `tests/booking-management.spec.js` | Full stack; use `rahulshetty1@gmail.com` / `rahulshetty1@yahoo.com` |
+1. **API layer first** (31 tests) — biggest coverage gap, no new tooling needed, directly exercises the business rules and security boundaries that are currently completely unverified.
+2. **Security API subset as a priority slice within #1** — TC-200/201/202/203/204/206/209/210 close the P0 gap called out in anti-pattern #6.
+3. **Unit layer** (3 tests) — small, fast, no tooling blockers for TC-003/TC-109/TC-205 (`authMiddleware` is plain Node, testable without a framework if needed).
+4. **E2E cleanup** — replace existing `TC-102` (anti-pattern #1) and retag existing tests to current IDs (anti-pattern #5) before adding TC-008 and TC-200 as new E2E tests, landing on the 4-test critical set defined above.
+5. **Component layer** — flag as blocked pending Jest + React Testing Library setup; surface this to the user rather than silently writing these as extra E2E tests.
