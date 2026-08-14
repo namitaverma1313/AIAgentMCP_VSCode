@@ -3,14 +3,19 @@
 #
 # PURPOSE:
 #   Runs the full Playwright test suite against the deployed production
-#   environment on every push to main. Uploads the HTML report as an artifact
-#   so results can be reviewed directly in the GitHub Actions UI.
+#   environment on every push to main. Tests run INSIDE the Docker image built
+#   from ./Dockerfile (Node 20 + all Playwright browsers pre-installed) rather
+#   than being installed directly on the runner — the same image used for local
+#   `docker compose up` runs here too, so CI and local runs can't drift apart.
+#   Uploads the HTML report as an artifact so results can be reviewed directly
+#   in the GitHub Actions UI.
 #
 # TRIGGER: push to main
 #
 # NOTES:
 #   - Tests run against https://eventhub.rahulshettyacademy.com (live site)
-#   - Chromium only (as configured in playwright.config.ts)
+#   - Chromium only at test-runtime (per playwright.config.ts projects), though
+#     the Docker image installs all three Playwright browsers
 #   - HTML report is retained for 30 days as a downloadable artifact
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -27,17 +32,14 @@ concurrency:
   group: playwright-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  NODE_VERSION: '21.7.1'
-
 jobs:
 
   # ╔═══════════════════════════════════════════════════════════════════════════
   # ║  Playwright Tests
-  # ║  Installs dependencies, runs all specs, and uploads the HTML report.
+  # ║  Builds the Docker image, runs all specs inside it, uploads the HTML report.
   # ╚═══════════════════════════════════════════════════════════════════════════
   playwright:
-    name: Run Playwright Tests
+    name: Run Playwright Tests (Docker)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -46,29 +48,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── Node.js setup ─────────────────────────────────────────────────────────
-      - name: Setup Node.js ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: package-lock.json
+      # ── Build the test image ─────────────────────────────────────────────────
+      # Node 20 + `npx playwright install --with-deps` (all browsers, OS deps) —
+      # see ./Dockerfile. docker/docker-compose are preinstalled on ubuntu-latest.
+      - name: Build Docker image
+        run: docker compose build
 
-      # ── Install root dependencies ────────────────────────────────────────────
-      - name: Install dependencies
-        run: npm ci
-
-      # ── Install Playwright browsers ──────────────────────────────────────────
-      # Only installs Chromium (--with-deps installs OS-level dependencies too)
-      - name: Install Playwright browsers
-        run: npx playwright install chromium --with-deps
-
-      # ── Run all Playwright tests ─────────────────────────────────────────────
-      # Tests run against the live site defined in playwright.config.ts.
-      # --reporter=html,line gives a browsable HTML report + inline line output.
-      # `|| true` ensures the artifact upload step always runs even if tests fail.
-      - name: Run Playwright tests
-        run: npx playwright test --reporter=html,line
+      # ── Run all Playwright tests inside the container ───────────────────────
+      # docker-compose.yml bind-mounts ./playwright-report and ./test-results,
+      # so the report lands on the runner's filesystem for the upload step below
+      # exactly as if the tests had run directly on the host.
+      # continue-on-error ensures the artifact upload step still runs on failure.
+      - name: Run Playwright tests in Docker container
+        run: docker compose run --rm playwright-tests
         continue-on-error: true
 
       # ── Upload HTML report as artifact ───────────────────────────────────────

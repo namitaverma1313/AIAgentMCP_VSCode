@@ -1,0 +1,12 @@
+services:
+  playwright-tests:
+    build: .
+    container_name: eventhub-playwright-tests
+    # ipc: host avoids Chromium crashing from Docker's small default /dev/shm size
+    ipc: host
+    volumes:
+      # Bind-mount the report/results dirs out so they survive after the
+      # container exits and are browsable on the host (test:report script,
+      # or just open playwright-report/index.html directly).
+      - ./playwright-report:/app/playwright-report
+      - ./test-results:/app/test-results

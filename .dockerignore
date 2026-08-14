@@ -1,0 +1,15 @@
+node_modules
+frontend
+backend
+docs
+.git
+.github
+.claude
+playwright-report
+test-results
+*.md
+.env
+.env.local
+.dockerignore
+Dockerfile
+docker-compose.yml

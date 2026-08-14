@@ -94,6 +94,18 @@ npm run dev
 
 ---
 
+## Run the Playwright Tests in Docker (no local Node/browsers needed)
+
+The E2E suite runs against the live deployed site (see `playwright.config.ts`), so no local app/DB setup is required to run it — just Docker.
+
+```bash
+docker compose up --build
+```
+
+That's it — one command. It builds an image on top of Playwright's official Docker image (Chromium prebuilt, version-matched to `package-lock.json`), installs deps, and runs the full suite. The HTML report is written to `./playwright-report/` on your machine via a volume mount — open `playwright-report/index.html` when it finishes (or run `npm run test:report` if you have Node installed).
+
+---
+
 ## Root Scripts
 
 | Script | Description |
